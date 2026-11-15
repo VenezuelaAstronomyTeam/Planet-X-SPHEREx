@@ -451,24 +451,21 @@ def _first_image_hdu(buf: bytes) -> tuple[int, int] | None:
         pos = end
 
 
-async def _download_cutout(client: httpx.AsyncClient, fits_url: str, ra: float, dec: float, size: float) -> bytes:
-    """Stream a cutout and stop once the IMAGE HDU is complete.
+BUSY_STATUS = (429, 500, 502, 503, 504)
+NO_OVERLAP_STATUS = (404, 422)
+
+
+async def _fetch_cutout(client: httpx.AsyncClient, url: str) -> tuple[bytes | None, int]:
+    """Stream one cutout and stop once the IMAGE HDU is complete.
 
     IRSA cuts every extension, so most of the payload is the EPSF table; the
     IMAGE HDU arrives first and the connection is closed there.
     """
-    url = _cutout_url(fits_url, ra, dec, size)
-    last_status: int | None = None
-    last_error: Exception | None = None
-
+    status = 0
     for attempt in range(3):
         try:
             async with client.stream("GET", url, timeout=httpx.Timeout(60.0, connect=10.0)) as response:
-                if response.status_code != 200:
-                    last_status = response.status_code
-                    if response.status_code not in (429, 500, 502, 503, 504):
-                        break
-                else:
+                if response.status_code == 200:
                     buffer = bytearray()
                     async for chunk in response.aiter_bytes(16384):
                         buffer.extend(chunk)
@@ -478,30 +475,77 @@ async def _download_cutout(client: httpx.AsyncClient, fits_url: str, ra: float, 
                         if found is not None:
                             start, end = found
                             if start == 0:
-                                return bytes(buffer[:end])
-                            return bytes(buffer[:2880]) + bytes(buffer[start:end])
+                                return bytes(buffer[:end]), 200
+                            return bytes(buffer[:2880]) + bytes(buffer[start:end]), 200
 
                     data = bytes(buffer)
                     if data[:2] == b"\x1f\x8b":
                         try:
                             data = gzip.decompress(data)
-                        except OSError as exc:
-                            raise HTTPException(502, "IRSA returned a corrupt compressed cutout.") from exc
-                    if data.startswith(b"SIMPLE"):
-                        return data
-                    last_error = HTTPException(502, "IRSA did not return a FITS cutout for this frame.")
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            last_error = exc
+                        except OSError:
+                            return None, 598
+                    return (data, 200) if data.startswith(b"SIMPLE") else (None, 598)
+                status = response.status_code
+                if status not in BUSY_STATUS:
+                    return None, status
+        except (httpx.TimeoutException, httpx.TransportError):
+            status = 599
         if attempt < 2:
             await asyncio.sleep(0.8 * (attempt + 1))
+    return None, status
 
-    if last_status is not None and last_status not in (429, 500, 502, 503, 504):
-        raise HTTPException(502, f"IRSA cutout request failed (HTTP {last_status}).")
-    if last_status in (429, 500, 502, 503, 504):
-        raise HTTPException(502, f"IRSA cutout service is busy (HTTP {last_status}). Please retry in a moment.")
-    if isinstance(last_error, HTTPException):
-        raise last_error
-    raise HTTPException(504, "IRSA is taking too long to return this cutout. Please retry.") from last_error
+
+def _cutout_error(status: int) -> HTTPException:
+    if status == 599:
+        return HTTPException(504, "IRSA is taking too long to return this cutout. Please retry.")
+    if status == 598:
+        return HTTPException(502, "IRSA did not return a FITS cutout for this frame.")
+    if status in BUSY_STATUS:
+        return HTTPException(502, f"IRSA cutout service is busy (HTTP {status}). Please retry in a moment.")
+    return HTTPException(502, f"IRSA cutout request failed (HTTP {status}).")
+
+
+async def _download_cutout(
+    client: httpx.AsyncClient, fits_url: str, ra: float, dec: float, size: float
+) -> tuple[bytes, float]:
+    """Download a cutout, widening the box when IRSA rejects the small region.
+
+    IRSA answers 422 "Arrays do not overlap" for some files when the box is tiny,
+    so the same position is asked again at 2x and 4x and cropped back locally.
+    """
+    sizes = [size]
+    for factor in (2.0, 4.0):
+        wider = min(size * factor, 1.0)
+        if wider > sizes[-1] * 1.0001:
+            sizes.append(wider)
+
+    status = 0
+    for used in sizes:
+        data, status = await _fetch_cutout(client, _cutout_url(fits_url, ra, dec, used))
+        if data is not None:
+            return data, used
+        if status not in NO_OVERLAP_STATUS and status != 598:
+            break
+    raise _cutout_error(status)
+
+
+def _crop_center(array: np.ndarray, fraction: float) -> np.ndarray:
+    height, width = array.shape
+    new_h = max(4, int(round(height * fraction)))
+    new_w = max(4, int(round(width * fraction)))
+    y0 = (height - new_h) // 2
+    x0 = (width - new_w) // 2
+    return array[y0 : y0 + new_h, x0 : x0 + new_w]
+
+
+async def _cutout_data(
+    client: httpx.AsyncClient, fits_url: str, ra: float, dec: float, size: float
+) -> tuple[np.ndarray, dict[str, Any], float]:
+    data, used = await _download_cutout(client, fits_url, ra, dec, size)
+    array, header = _read_image_hdu(data)
+    if used > size:
+        array = _crop_center(array, size / used)
+    return array, header, used
 
 
 def _read_image_hdu(data: bytes) -> tuple[np.ndarray, dict[str, Any]]:
@@ -523,9 +567,7 @@ def _read_image_hdu(data: bytes) -> tuple[np.ndarray, dict[str, Any]]:
     return np.flipud(array), header
 
 
-def _load_cutout_array(data: bytes) -> np.ndarray:
-    array, _ = _read_image_hdu(data)
-
+def _normalize_array(array: np.ndarray) -> np.ndarray:
     finite = np.isfinite(array)
     if finite.sum() < 16:
         raise HTTPException(422, "The SPHEREx cutout is empty (all pixels are NaN).")
@@ -803,8 +845,7 @@ async def photometry(request: Request, body: PhotometryRequest) -> dict[str, Any
             return {**base, **cached}
         try:
             async with semaphore:
-                data = await _download_cutout(client, item.fits_url, body.ra, body.dec, body.size)
-            array, header = _read_image_hdu(data)
+                array, header, _used = await _cutout_data(client, item.fits_url, body.ra, body.dec, body.size)
             measurements = _aperture_photometry(array, body.size, str(header.get("BUNIT", "")))
         except HTTPException as exc:
             return {**base, "error": exc.detail}
@@ -842,8 +883,8 @@ async def cutout(
     if cached is not None:
         return _png_response(cached)
 
-    data = await _download_cutout(request.app.state.http, fits_url, ra, dec, size)
-    normalized = _load_cutout_array(data)
+    array, _header, _used = await _cutout_data(request.app.state.http, fits_url, ra, dec, size)
+    normalized = _normalize_array(array)
     png = _png_from_normalized(normalized, colormap)
     PNG_CACHE.set(key, png)
     return _png_response(png)
@@ -863,12 +904,12 @@ async def difference(
     if colormap.lower() not in COLORMAPS:
         raise HTTPException(400, f"colormap must be one of {', '.join(COLORMAPS)}")
     client = request.app.state.http
-    first, second = await asyncio.gather(
-        _download_cutout(client, fits_url_1, ra, dec, size),
-        _download_cutout(client, fits_url_2, ra, dec, size),
+    (first, _h1, _u1), (second, _h2, _u2) = await asyncio.gather(
+        _cutout_data(client, fits_url_1, ra, dec, size),
+        _cutout_data(client, fits_url_2, ra, dec, size),
     )
-    a = _render_array(_load_cutout_array(first), "gray").convert("L")
-    b = _render_array(_load_cutout_array(second), "gray").convert("L")
+    a = _render_array(_normalize_array(first), "gray").convert("L")
+    b = _render_array(_normalize_array(second), "gray").convert("L")
     delta = np.asarray(b, dtype=np.float32) - np.asarray(a, dtype=np.float32)
     scale = float(np.percentile(np.abs(delta), 99.5)) or 1.0
     scaled = np.clip(delta / scale, -1.0, 1.0)
@@ -903,8 +944,8 @@ async def export_gif(request: Request, body: GifRequest) -> Response:
 
     async def frame(url: str) -> Image.Image:
         async with semaphore:
-            data = await _download_cutout(client, url, body.ra, body.dec, body.size)
-        return _render_array(_load_cutout_array(data), body.colormap.lower()).convert("RGB")
+            array, _header, _used = await _cutout_data(client, url, body.ra, body.dec, body.size)
+        return _render_array(_normalize_array(array), body.colormap.lower()).convert("RGB")
 
     frames = await asyncio.gather(*(frame(url) for url in body.fits_urls))
     buffer = io.BytesIO()
@@ -932,6 +973,15 @@ INDEX_HTML = r'''<!doctype html>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
     <title>Planet X &amp; SPHEREx — Time-lapse infrarrojo</title>
+    <script>
+      (() => {
+        const warn = console.warn;
+        console.warn = (...args) => {
+          if (typeof args[0] === "string" && args[0].includes("cdn.tailwindcss.com")) return;
+          warn.apply(console, args);
+        };
+      })();
+    </script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
       tailwind.config = {
