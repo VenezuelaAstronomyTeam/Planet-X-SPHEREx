@@ -19,7 +19,7 @@ A small web app that finds real calibrated **SPHEREx** images at **NASA/IPAC IRS
 
 ## Requirements
 
-- **Python 3.11+**
+- **Python 3.11 or newer** (tested on 3.11, 3.12, 3.13 and 3.14)
 - Internet access to `irsa.ipac.caltech.edu`
 - A modern browser (Chrome, Edge, Firefox or Safari)
 
@@ -87,7 +87,7 @@ Use the **Casual / Science** switch in the header. The mode is stored in the URL
 planet-x-spherex/
 ├── backend/
 │   └── main.py          # FastAPI server + the whole UI embedded as INDEX_HTML
-├── requirements.txt     # pinned Python dependencies
+├── requirements.txt     # Python dependencies (compatible version ranges)
 ├── run.bat              # one-click Windows launcher
 ├── .gitignore           # excludes .venv, caches and OS/editor files
 └── README.md            # this file
